@@ -16,13 +16,13 @@ export async function saveProjectScan(
       user_id: userId,
       repo_full_name: repoFullName,
       scanned_at: scanResult.scannedAt,
-      score: scanResult.score,
-      files: scanResult.files,
+      score: scanResult.overallScore,
+      documents: scanResult.documents,
+      quick_wins: scanResult.quickWins,
       summary: scanResult.summary,
     },
     { onConflict: 'user_id,repo_full_name' }
   )
-
   if (error) {
     console.error('Supabase save error:', error)
     throw new Error(`Failed to save scan: ${error.message}`)
@@ -35,7 +35,6 @@ export async function getProjectScans(userId: string) {
     .select('*')
     .eq('user_id', userId)
     .order('scanned_at', { ascending: false })
-
   if (error) throw new Error(`Failed to fetch scans: ${error.message}`)
   return data
 }
