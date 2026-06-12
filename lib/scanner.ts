@@ -1,142 +1,89 @@
-import { fetchDocFiles } from './github'
-
-const APPSHIELD_DOCS = [
-  'conventions.md',
-  'locked-patterns.md',
-  'knowledge-base.md',
-  'session-handoff.md',
-  'update-process.md',
-  'decision-log.md',
-  'agent-workflow.md',
-]
-
-export interface DocScore {
-  name: string
-  present: boolean
-  score: number
-  placeholderCount: number
-  wordCount: number
-  lastCommitDate: string | null
-  daysSinceUpdate: number | null
-  stalenessLabel: 'fresh' | 'active' | 'stale' | 'critical' | 'missing'
-  issues: string[]
-}
+import { Octokit } from '@octokit/rest'
 
 export interface ScanResult {
-  overallScore: number
-  documents: DocScore[]
-  quickWins: string[]
+  repoFullName: string
   scannedAt: string
-}
-
-function countPlaceholders(content: string): number {
-  const matches = content.match(/\[PLACEHOLDER[^\]]*\]/g)
-  return matches ? matches.length : 0
-}
-
-function countWords(content: string): number {
-  return content.trim().split(/\s+/).length
-}
-
-function getDaysSince(dateStr: string): number {
-  const then = new Date(dateStr).getTime()
-  const now = Date.now()
-  return Math.floor((now - then) / (1000 * 60 * 60 * 24))
-}
-
-function getStalenessLabel(
-  docName: string,
-  days: number | null
-): DocScore['stalenessLabel'] {
-  if (days === null) return 'missing'
-  // session-handoff.md has stricter rules
-  if (docName === 'session-handoff.md') {
-    if (days <= 2) return 'fresh'
-    if (days <= 7) return 'active'
-    if (days <= 14) return 'stale'
-    return 'critical'
-  }
-  if (days <= 7) return 'fresh'
-  if (days <= 30) return 'active'
-  if (days <= 60) return 'stale'
-  return 'critical'
-}
-
-function scoreDocument(name: string, content: string | null, lastCommitDate: string | null): DocScore {
-  const issues: string[] = []
-  let score = 0
-
-  if (!content) {
-    return {
-      name,
-      present: false,
-      score: 0,
-      placeholderCount: 0,
-      wordCount: 0,
-      lastCommitDate: null,
-      daysSinceUpdate: null,
-      stalenessLabel: 'missing',
-      issues: [`${name} is missing — create it from the AppShield template`],
-    }
-  }
-
-  score += 20 // present
-
-  const placeholderCount = countPlaceholders(content)
-  if (placeholderCount === 0) {
-    score += 30
-  } else {
-    issues.push(`Fill ${placeholderCount} remaining placeholder${placeholderCount > 1 ? 's' : ''} in ${name}`)
-  }
-
-  const daysSinceUpdate = lastCommitDate ? getDaysSince(lastCommitDate) : null
-  const stalenessLabel = getStalenessLabel(name, daysSinceUpdate)
-
-  if (daysSinceUpdate !== null && daysSinceUpdate < 30) {
-    score += 25
-  } else if (daysSinceUpdate !== null) {
-    issues.push(`${name} hasn't been updated in ${daysSinceUpdate} days`)
-  }
-
-  const wordCount = countWords(content)
-  if (wordCount > 100) {
-    score += 25
-  } else {
-    issues.push(`${name} looks incomplete — add more detail (currently ${wordCount} words)`)
-  }
-
-  return {
-    name,
-    present: true,
-    score,
-    placeholderCount,
-    wordCount,
-    lastCommitDate,
-    daysSinceUpdate,
-    stalenessLabel,
-    issues,
+  score: number
+  files: {
+    name: string
+    present: boolean
+    fresh: boolean
+    complete: boolean
+  }[]
+  summary: {
+    total: number
+    present: number
+    missing: string[]
   }
 }
 
-export async function scanRepository(repoFullName: string, token?: string): Promise<ScanResult> {
-  const docFiles = await fetchDocFiles(repoFullName, token)
+const REQUIRED_FILES = [
+  'README.md',
+  'SECURITY.md',
+  'CONTRIBUTING.md',
+  '.github/CODEOWNERS',
+  '.github/dependabot.yml',
+  'LICENSE',
+  '.github/workflows/ci.yml',
+]
 
-  const documents = APPSHIELD_DOCS.map(name =>
-    scoreDocument(name, docFiles[name].content, docFiles[name].lastCommitDate)
+export async function scanRepository(
+  repoFullName: string,
+  githubToken?: string
+): Promise<ScanResult> {
+  const [owner, repo] = repoFullName.split('/')
+  const octokit = new Octokit({ auth: githubToken })
+
+  const fileResults = await Promise.all(
+    REQUIRED_FILES.map(async (filePath) => {
+      try {
+        const { data } = await octokit.repos.getContent({ owner, repo, path: filePath })
+        const file = Array.isArray(data) ? null : data
+        const present = !!file
+        // Check freshness: updated within last 180 days
+        let fresh = false
+        if (present) {
+          const commits = await octokit.repos.listCommits({
+            owner,
+            repo,
+            path: filePath,
+            per_page: 1,
+          })
+          if (commits.data.length > 0) {
+            const lastCommitDate = new Date(
+              commits.data[0].commit.committer?.date ?? commits.data[0].commit.author?.date ?? ''
+            )
+            const daysSince = (Date.now() - lastCommitDate.getTime()) / (1000 * 60 * 60 * 24)
+            fresh = daysSince < 180
+          }
+        }
+        // Completeness: file size > 100 bytes = has real content
+        const complete = present && (file as { size?: number })?.size !== undefined && ((file as { size: number }).size > 100)
+        return { name: filePath, present, fresh, complete }
+      } catch {
+        return { name: filePath, present: false, fresh: false, complete: false }
+      }
+    })
   )
 
-  const overallScore = Math.round(
-    documents.reduce((sum, d) => sum + d.score, 0) / documents.length
-  )
+  const presentFiles = fileResults.filter((f) => f.present)
+  const missingFiles = fileResults.filter((f) => !f.present).map((f) => f.name)
 
-  // Generate Quick Wins from all issues, prioritized
-  const allIssues = documents.flatMap(d => d.issues)
-  const quickWins = allIssues.slice(0, 5)
+  // Score: presence 50% + completeness 30% + freshness 20%
+  const presenceScore = (presentFiles.length / REQUIRED_FILES.length) * 50
+  const completenessScore = (fileResults.filter((f) => f.complete).length / REQUIRED_FILES.length) * 30
+  const freshnessScore = (fileResults.filter((f) => f.fresh).length / REQUIRED_FILES.length) * 20
+  const score = Math.round(presenceScore + completenessScore + freshnessScore)
 
   return {
-    overallScore,
-    documents,
-    quickWins,
+    repoFullName,
     scannedAt: new Date().toISOString(),
+    score,
+    files: fileResults,
+    summary: {
+      total: REQUIRED_FILES.length,
+      present: presentFiles.length,
+      missing: missingFiles,
+    },
   }
 }
